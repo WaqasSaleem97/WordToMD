@@ -1,4 +1,4 @@
-name: Convert DOCX to Markdown (changed files only, place md next to docx, images in <name>/images)
+name: Convert DOCX to Markdown
 
 on:
   push:
