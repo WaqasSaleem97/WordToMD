@@ -36,24 +36,24 @@ jobs:
               )
               mdfile="converted/${filename}.md"
 
-              # Remove Pandoc image attributes like {width="..." height="..."} (handles multi-line attributes)
+              # 1) Remove Pandoc inline image attribute blocks like {width="..." height="..."} (handles multi-line attrs)
               if [ -f "$mdfile" ]; then
                 perl -0777 -pe 's/!\[([^\]]*)\]\(([^)]+)\)\{[^}]+\}/![\1](\2)/gs' -i "$mdfile" || true
               fi
 
-              # Normalize any HTML <img ... src="..."> or <img ... src='...'> to Markdown ![](src)
+              # 2) Normalize HTML <img> tags to Markdown image syntax (double- and single-quoted src)
               if [ -f "$mdfile" ]; then
-                sed -E -i 's#<img[^>]*src="([^"]+)"[^>]*\/?>#![](\1)#gI' "$mdfile" || true
-                sed -E -i "s#<img[^>]*src='([^']+)'[^>]*\/?>#![](\1)#gI" "$mdfile" || true
+                sed -E -i 's#<img[^>]*src="([^"]+)"[^>]*/?>#![](\1)#gI' "$mdfile" || true
+                sed -E -i "s#<img[^>]*src='([^']+)'[^>]*/?>#![](\1)#gI" "$mdfile" || true
               fi
 
-              # Ensure each image is on its own paragraph (blank lines around)
+              # 3) Ensure each image is on its own paragraph (blank lines above and below)
               if [ -f "$mdfile" ]; then
                 perl -0777 -pe 's#\s*(\!\[[^\]]*\]\([^\)]+\))\s*#\n\n\1\n\n#g' -i "$mdfile" || true
               fi
 
-              # Move images that appear immediately before a text block to after that block.
-              # This swaps: IMAGE + TEXT_BLOCK  -> TEXT_BLOCK + IMAGE
+              # 4) Move images that appear immediately before a text block to after that block.
+              #    Swap: IMAGE + TEXT_BLOCK  ->  TEXT_BLOCK + IMAGE
               if [ -f "$mdfile" ]; then
                 perl -0777 -pe '1 while s{(^|\n)(!\[[^\]]*\]\([^\)]+\))\s*([^\n].*?)(\n{2,}|\z)}{$1$3\n\n$2$4}gms' -i "$mdfile" || true
               fi
