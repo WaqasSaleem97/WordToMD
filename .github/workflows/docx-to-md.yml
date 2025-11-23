@@ -27,11 +27,13 @@ jobs:
           find . -type f -name "*.docx" -print0 | while IFS= read -r -d '' file; do
             if [ -f "$file" ]; then
               filename=$(basename "$file" .docx)
-              media_dir="converted/${filename}_media"
-              mkdir -p "$media_dir"
-              pandoc "$file" -f docx -t markdown -o "converted/${filename}.md" --extract-media="$media_dir"
-              # Remove Pandoc image attributes like {width="..." height="..."}
-              sed -i -E 's/!\[([^\]]*)\]\(([^)]+)\)\{[^}]+\}/![\1](\2)/g' "converted/${filename}.md"
+              # Run pandoc from inside converted/ so media paths are relative to the .md file.
+              (
+                cd converted
+                pandoc "../$file" -f docx -t gfm -o "${filename}.md" --extract-media="${filename}_media"
+              )
+              # Remove Pandoc image attributes like {width="..." height="..."} (handles multi-line attributes)
+              perl -0777 -pe 's/!\[([^\]]*)\]\(([^)]+)\)\{[^}]+\}/![\1](\2)/gs' -i "converted/${filename}.md"
             else
               echo "File not found: $file"
             fi
