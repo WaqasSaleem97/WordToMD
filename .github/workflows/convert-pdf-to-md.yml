@@ -16,12 +16,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Install tools (pandoc + poppler-utils)
+      - name: Install tools (pandoc, poppler-utils, OCR)
         run: |
           sudo apt-get update
-          sudo apt-get install -y pandoc poppler-utils
+          sudo apt-get install -y pandoc poppler-utils ocrmypdf tesseract-ocr
 
-      - name: Convert PDFs to Markdown (extract images)
+      - name: Convert PDFs to Markdown (extract images, no HTML left)
         run: |
           mkdir -p converted
           find . -type f -name "*.pdf" -print0 | while IFS= read -r -d '' file; do
@@ -32,29 +32,38 @@ jobs:
               (
                 cd converted
 
-                # Try pdftohtml -> HTML with images
+                # Try pdftohtml -> HTML (with images) and convert to Markdown
                 if pdftohtml -c -s "../$file" "${filename}.html" >/dev/null 2>&1; then
-                  echo "pdftohtml succeeded for $file"
-                  # pdftohtml may create a directory like name.html_files or name_files - normalize to _media
-                  if [ -d "${filename}.html_files" ]; then mv "${filename}.html_files" "${filename}_media"; fi
-                  if [ -d "${filename}_files" ]; then mv "${filename}_files" "${filename}_media"; fi
-                  if [ -d "${filename}-files" ]; then mv "${filename}-files" "${filename}_media"; fi
+                  # normalize potential media dirs into ${filename}_media
+                  for d in "${filename}.html_files" "${filename}_files" "${filename}-files" "${filename}_files"; do
+                    [ -d "$d" ] && mv "$d" "${filename}_media"
+                  done
 
-                  # Convert HTML to Markdown, telling pandoc to extract media into the _media folder
+                  # Convert HTML to Markdown (GitHub-flavored) and extract media into _media
                   pandoc "${filename}.html" -f html -t gfm -o "${filename}.md" --extract-media="${filename}_media" || true
+                  rm -f "${filename}.html"
                 else
-                  echo "pdftohtml failed or produced no HTML; falling back to pdfimages + pdftotext"
-                  # Fallback: extract images and text separately
-                  pdfimages -all "../$file" "${filename}_media/image" || true
-                  pdftotext -layout "../$file" "${filename}.txt" || true
-                  if [ -f "${filename}.txt" ]; then
-                    # Convert the text file into markdown (basic)
+                  # Fallback: try text extraction + images. If no text, run OCR and retry.
+                  pdftotext -layout "../$file" "${filename}.txt" >/dev/null 2>&1 || true
+
+                  if [ -s "${filename}.txt" ]; then
+                    # We have text: convert to markdown and extract embedded images
                     pandoc "${filename}.txt" -f markdown -t gfm -o "${filename}.md" || cp "${filename}.txt" "${filename}.md"
+                    pdfimages -all "../$file" "${filename}_media/image" >/dev/null 2>&1 || true
                   else
-                    echo "Warning: no text extracted for $file"
-                    # Create an empty md with note
-                    echo "<!-- No text extracted from ${file} -->" > "${filename}.md"
+                    # Try OCR then extract again
+                    ocrmypdf "../$file" "${filename}_ocr.pdf" >/dev/null 2>&1 || true
+                    pdftotext -layout "${filename}_ocr.pdf" "${filename}.txt" >/dev/null 2>&1 || true
+                    if [ -s "${filename}.txt" ]; then
+                      pandoc "${filename}.txt" -f markdown -t gfm -o "${filename}.md" || cp "${filename}.txt" "${filename}.md"
+                      pdfimages -all "${filename}_ocr.pdf" "${filename}_media/image" >/dev/null 2>&1 || true
+                    else
+                      echo "<!-- No text extracted from ${file} -->" > "${filename}.md"
+                    fi
+                    rm -f "${filename}_ocr.pdf"
                   fi
+
+                  rm -f "${filename}.txt"
                 fi
 
                 # Remove Pandoc inline image attributes like {width="..." height="..."} even if multi-line
