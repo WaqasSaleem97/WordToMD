@@ -1,63 +1,81 @@
 #!/usr/bin/env python3
 """
-fix_md_images.py <file.md>
+.github/scripts/fix_md_images.py
 
 Move leading <img...> (HTML) or leading markdown images that are
 at the start of a paragraph block to a separate block immediately
 after that paragraph.
 
-Usage:
-  # print transformed markdown to stdout
-  python3 .github/scripts/fix_md_images.py converted/CC-Lab4-Sarosh059.md
+This updated version also handles images that are immediately followed
+(with no whitespace) by a triple-asterisk bold paragraph like:
 
-  # overwrite file in place
-  python3 .github/scripts/fix_md_images.py converted/CC-Lab4-Sarosh059.md --inplace
+<img .../>***Open VMware ...***
+
+Usage:
+  python3 .github/scripts/fix_md_images.py converted/yourfile.md --inplace
 """
 import re
 import sys
 from pathlib import Path
 
-IMG_HTML_RE = re.compile(r'^\s*(?P<img>(?:<img\b[^>]*>)+)\s*(?P<rest>[\s\S]*)$', re.I)
-IMG_MD_RE   = re.compile(r'^\s*(?P<img>(?:!\[[^\]]*\]\([^\)]+\)\s*)+)(?P<rest>[\s\S]*)$', re.I)
+# Matches an HTML <img ...> tag (single or multiple)
+IMG_HTML_RE = re.compile(r'(?P<img><img\b[^>]*\/?>)', re.I | re.S)
+# Matches leading HTML img(s) at start of block (possibly with attributes broken across lines)
+LEADING_IMG_HTML_BLOCK = re.compile(r'^\s*(?P<img>(?:<img\b[^>]*\/?>\s*)+)(?P<rest>[\s\S]*)$', re.I)
+# Matches leading Markdown images at start of block
+LEADING_IMG_MD_BLOCK = re.compile(r'^\s*(?P<img>(?:!\[[^\]]*\]\([^\)]+\)\s*)+)(?P<rest>[\s\S]*)$', re.I)
+
+# Specific pattern: img immediately followed by triple-asterisk bold (no space)
+IMG_PLUS_TRIPLE_ASTERISK = re.compile(r'^\s*(?P<img><img\b[^>]*\/?>)\s*(?P<triple>\*{3}[\s\S]*?\*{3})(?P<rest>[\s\S]*)$', re.I)
 
 def process_text(text: str) -> str:
-    # Split into blocks by blank lines (one or more). Preserve leading/trailing whitespace inside blocks.
+    # Split into blocks separated by one or more blank lines (preserve internal newlines)
     blocks = re.split(r'\n\s*\n', text)
     out_blocks = []
 
     for block in blocks:
-        # Try HTML <img> leading
-        m = IMG_HTML_RE.match(block)
+        # 0) Specific: image immediately followed by ***...*** (no space may be present)
+        m_spec = IMG_PLUS_TRIPLE_ASTERISK.match(block)
+        if m_spec:
+            img = m_spec.group('img').strip()
+            triple = m_spec.group('triple').strip()
+            rest = m_spec.group('rest').lstrip()
+            # Desired order: triple block, (rest if any), then image block on separate paragraph
+            if rest:
+                out_blocks.append(f"{triple}\n\n{rest}")
+            else:
+                out_blocks.append(triple)
+            out_blocks.append(img)
+            continue
+
+        # 1) Leading HTML <img> tags in same block
+        m = LEADING_IMG_HTML_BLOCK.match(block)
         if m:
-            img = m.group('img').rstrip()
+            img = m.group('img').strip()
             rest = m.group('rest').lstrip()
-            if rest:  # leading image + text in same block -> move image AFTER the paragraph
-                # append paragraph (rest) then image as its own block
+            if rest:
                 out_blocks.append(rest)
                 out_blocks.append(img)
-                continue
             else:
-                # block is image-only, keep as-is
                 out_blocks.append(img)
-                continue
+            continue
 
-        # Try markdown image leading
-        m2 = IMG_MD_RE.match(block)
+        # 2) Leading Markdown images in same block
+        m2 = LEADING_IMG_MD_BLOCK.match(block)
         if m2:
-            img = m2.group('img').rstrip()
+            img = m2.group('img').strip()
             rest = m2.group('rest').lstrip()
             if rest:
                 out_blocks.append(rest)
                 out_blocks.append(img)
-                continue
             else:
                 out_blocks.append(img)
-                continue
+            continue
 
-        # No leading image, keep block unchanged
+        # 3) If no leading image, keep block as-is
         out_blocks.append(block)
 
-    # Rejoin with two newlines between blocks, then normalize any 3+ newlines down to 2
+    # Rejoin with two newlines and collapse any 3+ newlines down to 2
     out = '\n\n'.join(out_blocks)
     out = re.sub(r'\n{3,}', '\n\n', out)
     return out
