@@ -2,81 +2,76 @@
 """
 .github/scripts/fix_md_images.py
 
-Move leading <img...> (HTML) or leading markdown images that are
-at the start of a paragraph block to a separate block immediately
-after that paragraph.
+Post-process a Markdown file to ensure images are on their own paragraph
+and moved after any paragraph text they were accidentally inlined into.
 
-This updated version also handles images that are immediately followed
-(with no whitespace) by a triple-asterisk bold paragraph like:
-
-<img .../>***Open VMware ...***
+Behavior:
+- For each paragraph-block (blocks separated by one or more blank lines):
+  - If the block contains both text and one or more images (HTML <img ...> or Markdown ![alt](src)),
+    remove the image tokens from the block, keep the text as the paragraph, then append each image
+    as its own paragraph immediately after the paragraph text (preserving their original order).
+  - If the block contains only images, leave it as-is (one image per paragraph).
+  - If the block contains no images, keep it unchanged.
 
 Usage:
-  python3 .github/scripts/fix_md_images.py converted/yourfile.md --inplace
+  # Show transformed output
+  python3 .github/scripts/fix_md_images.py converted/file.md
+
+  # Overwrite file in-place
+  python3 .github/scripts/fix_md_images.py converted/file.md --inplace
 """
+from pathlib import Path
 import re
 import sys
-from pathlib import Path
 
-# Matches an HTML <img ...> tag (single or multiple)
-IMG_HTML_RE = re.compile(r'(?P<img><img\b[^>]*\/?>)', re.I | re.S)
-# Matches leading HTML img(s) at start of block (possibly with attributes broken across lines)
-LEADING_IMG_HTML_BLOCK = re.compile(r'^\s*(?P<img>(?:<img\b[^>]*\/?>\s*)+)(?P<rest>[\s\S]*)$', re.I)
-# Matches leading Markdown images at start of block
-LEADING_IMG_MD_BLOCK = re.compile(r'^\s*(?P<img>(?:!\[[^\]]*\]\([^\)]+\)\s*)+)(?P<rest>[\s\S]*)$', re.I)
+# Combined pattern that matches HTML <img ...> (non-greedy) OR Markdown images ![alt](url)
+IMG_COMBINED_RE = re.compile(r'(<img\b[\s\S]*?>|!\[[^\]]*\]\([^\)]+\))', re.I)
 
-# Specific pattern: img immediately followed by triple-asterisk bold (no space)
-IMG_PLUS_TRIPLE_ASTERISK = re.compile(r'^\s*(?P<img><img\b[^>]*\/?>)\s*(?P<triple>\*{3}[\s\S]*?\*{3})(?P<rest>[\s\S]*)$', re.I)
+# Splits blocks by one or more blank lines (keeps internal newlines in a block)
+BLOCK_SPLIT_RE = re.compile(r'\n\s*\n', re.M)
 
 def process_text(text: str) -> str:
-    # Split into blocks separated by one or more blank lines (preserve internal newlines)
-    blocks = re.split(r'\n\s*\n', text)
+    blocks = BLOCK_SPLIT_RE.split(text)
     out_blocks = []
 
     for block in blocks:
-        # 0) Specific: image immediately followed by ***...*** (no space may be present)
-        m_spec = IMG_PLUS_TRIPLE_ASTERISK.match(block)
-        if m_spec:
-            img = m_spec.group('img').strip()
-            triple = m_spec.group('triple').strip()
-            rest = m_spec.group('rest').lstrip()
-            # Desired order: triple block, (rest if any), then image block on separate paragraph
-            if rest:
-                out_blocks.append(f"{triple}\n\n{rest}")
-            else:
-                out_blocks.append(triple)
-            out_blocks.append(img)
+        if not block.strip():
+            # preserve empty blocks as empty (they will be collapsed later)
+            out_blocks.append('')
             continue
 
-        # 1) Leading HTML <img> tags in same block
-        m = LEADING_IMG_HTML_BLOCK.match(block)
-        if m:
-            img = m.group('img').strip()
-            rest = m.group('rest').lstrip()
-            if rest:
-                out_blocks.append(rest)
-                out_blocks.append(img)
-            else:
-                out_blocks.append(img)
+        # find images and their positions (ordered)
+        matches = list(IMG_COMBINED_RE.finditer(block))
+        if not matches:
+            out_blocks.append(block)
             continue
 
-        # 2) Leading Markdown images in same block
-        m2 = LEADING_IMG_MD_BLOCK.match(block)
-        if m2:
-            img = m2.group('img').strip()
-            rest = m2.group('rest').lstrip()
-            if rest:
-                out_blocks.append(rest)
-                out_blocks.append(img)
-            else:
-                out_blocks.append(img)
-            continue
+        # Extract images in order
+        images = [m.group(0).strip() for m in matches]
 
-        # 3) If no leading image, keep block as-is
-        out_blocks.append(block)
+        # Remove matched image substrings from the block by replacing them with a single space
+        # Doing replacements from end->start to preserve indices
+        new_block = block
+        for m in reversed(matches):
+            start, end = m.start(), m.end()
+            # replace slice with a single space to avoid accidental word concatenation
+            new_block = new_block[:start] + ' ' + new_block[end:]
 
-    # Rejoin with two newlines and collapse any 3+ newlines down to 2
-    out = '\n\n'.join(out_blocks)
+        # Normalize whitespace
+        new_block = new_block.strip()
+        # If new_block still has textual content, keep it as the paragraph first
+        if new_block:
+            out_blocks.append(new_block)
+            # append each image as a separate paragraph block
+            for img in images:
+                out_blocks.append(img)
+        else:
+            # block had only images (or images + whitespace). Keep each image as its own paragraph
+            for img in images:
+                out_blocks.append(img)
+
+    # Rejoin blocks with exactly two newlines between blocks, then collapse 3+ newlines to 2
+    out = '\n\n'.join([b for b in out_blocks if b is not None])
     out = re.sub(r'\n{3,}', '\n\n', out)
     return out
 
@@ -88,7 +83,7 @@ def main():
     path = Path(sys.argv[1])
     inplace = '--inplace' in sys.argv[2:]
 
-    if not path.is_file():
+    if not path.exists() or not path.is_file():
         print(f"File not found: {path}", file=sys.stderr)
         sys.exit(1)
 
