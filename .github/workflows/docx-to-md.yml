@@ -22,8 +22,12 @@ jobs:
         run: |
           mkdir -p converted
           find . -type f -name "*.docx" -print0 | while IFS= read -r -d '' file; do
-            filename=$(basename "$file" .docx)
-            pandoc "$file" -f docx -t markdown -o "converted/${filename}.md"
+            if [ -f "$file" ]; then
+              filename=$(basename "$file" .docx)
+              pandoc "$file" -f docx -t markdown -o "converted/${filename}.md"
+            else
+              echo "File not found: $file"
+            fi
           done
 
       - name: Commit and push converted files
