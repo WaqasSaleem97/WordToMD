@@ -25,55 +25,57 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p converted
-          find . -type f -name "*.docx" -print0 | while IFS= read -r -d '' file; do
-            if [ -f "$file" ]; then
-              filename=$(basename "$file" .docx)
-              echo "Converting: $file -> converted/${filename}.md"
-              # Run pandoc from inside converted/ so media paths are relative to the .md file.
-              (
-                cd converted
-                pandoc "../$file" -f docx -t gfm -o "${filename}.md" --extract-media="${filename}_media"
-              )
-              mdfile="converted/${filename}.md"
-
-              # 1) Remove Pandoc inline image attribute blocks like {width="..." height="..."} (handles multi-line attrs)
-              if [ -f "$mdfile" ]; then
-                perl -0777 -pe 's/!\[([^\]]*)\]\(([^)]+)\)\{[^}]+\}/![\1](\2)/gs' -i "$mdfile" || true
-              fi
-
-              # 2) Normalize HTML <img> to Markdown ![](src) (double- and single-quoted src)
-              if [ -f "$mdfile" ]; then
-                sed -E -i 's#<img[^>]*src="([^"]+)"[^>]*/?>#![](\1)#gI' "$mdfile" || true
-                sed -E -i "s#<img[^>]*src='([^']+)'[^>]*/?>#![](\1)#gI" "$mdfile" || true
-              fi
-
-              # 3) Ensure each image is on its own paragraph (blank lines around)
-              if [ -f "$mdfile" ]; then
-                perl -0777 -pe 's#\s*(\!\[[^\]]*\]\([^\)]+\))\s*#\n\n\1\n\n#g' -i "$mdfile" || true
-              fi
-
-              # 4) General swap: move images that appear immediately before a text block to after that block.
-              #    Swap: IMAGE + TEXT_BLOCK  ->  TEXT_BLOCK + IMAGE
-              if [ -f "$mdfile" ]; then
-                perl -0777 -pe '1 while s{(^|\n)(!\[[^\]]*\]\([^\)]+\))\s*([^\n].*?)(\n{2,}|\z)}{$1$3\n\n$2$4}gms' -i "$mdfile" || true
-              fi
-
-              # 5) SPECIFIC FIX: handle cases where an image is directly followed by a bold/strong paragraph
-              #    wrapped in triple asterisks (*** ... ***). This moves the image to after that ***...*** block.
-              #    It matches a Markdown image (from step 2) followed immediately by a ***...*** block (including newlines).
-              if [ -f "$mdfile" ]; then
-                perl -0777 -pe 's{(!\[[^\]]*\]\([^\)]+\))\s*(\*\*\*[\s\S]*?\*\*\*)}{$2\n\n$1}gsi' -i "$mdfile" || true
-              fi
-
-            else
-              echo "File not found: $file"
+          find . -type f -iname "*.docx" -print0 | while IFS= read -r -d '' file; do
+            [ -f "$file" ] || { echo "File not found: $file"; continue; }
+            filename=$(basename "$file" .docx)
+            echo "Converting: $file -> converted/${filename}.md"
+            (
+              cd converted
+              pandoc "../$file" -f docx -t gfm -o "${filename}.md" --extract-media="${filename}_media"
+            )
+            mdfile="converted/${filename}.md"
+            if [ ! -f "$mdfile" ]; then
+              echo "No markdown produced for ${filename}, skipping post-processing."
+              continue
             fi
+
+            # 1) Convert multiline HTML <img ...> tags to Markdown ![](src), prefer alt text if present
+            perl -0777 -pe '
+              # first, if img has alt attribute, use it: <img ... src="..." ... alt="ALT" ...>
+              s{<img\b(?:(?!>).)*?\bsrc=(["\'])(.*?)\1(?:(?!>).)*?\balt=(["\'])(.*?)\3(?:(?!>).)*?\/?>}{![$4]($2)}gsi;
+              # second, img without alt -> empty alt
+              s{<img\b(?:(?!>).)*?\bsrc=(["\'])(.*?)\1(?:(?!>).)*?\/?>}{![]($2)}gsi;
+            ' -i "$mdfile" || true
+
+            # 2) Ensure each image is on its own paragraph: add blank lines around image markdown
+            perl -0777 -pe 's/\s*(\!\[[^\]]*\]\([^\)]+\))\s*/\n\n\1\n\n/g' -i "$mdfile" || true
+
+            # 3) Specific fix: image immediately followed by a triple-asterisk bold paragraph (*** ... ***)
+            #    Move the image to after that entire bold block.
+            perl -0777 -pe 's{(\!\[[^\]]*\]\([^\)]+\))\s*(\*{3}[\s\S]*?\*{3})}{$2\n\n$1}gsi' -i "$mdfile" || true
+
+            # 4) General swap: if an image is immediately followed by a paragraph (non-heading/list/blockquote),
+            #    move the image after that paragraph. This is a safe heuristic for most docs.
+            perl -0777 -pe '
+              1 while s{
+                (^|\n)                              # group1: leading boundary
+                (\!\[[^\]]*\]\([^\)]+\))            # group2: the image markdown
+                \s*                                 # optional whitespace
+                ((?:[^\n#>\-\*\n].*?)(?:\n(?:[^\n#>\-\*\n].*?))*)(\n{2,}|\z)  # group3: paragraph block (not heading/list/blockquote), group4: trailing separator
+              }{$1$3\n\n$2$4}gmsx' -i "$mdfile" || true
+
+            # 5) Cleanup: remove duplicate blank lines introduced by moves
+            perl -0777 -pe 's/\n{3,}/\n\n/gs' -i "$mdfile" || true
+
+            echo "Post-processing done for ${mdfile}"
           done
 
       - name: Commit and push converted files and media
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           git config --global user.name 'github-actions'
           git config --global user.email 'github-actions@github.com'
           git add converted/
-          git commit -m "Auto-converted DOCX to Markdown with cleaned image links" || echo "No changes to commit"
-          git push https://${{ secrets.GH_PAT }}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
+          git commit -m "Auto-convert DOCX -> Markdown (fix image positions)" || echo "No changes to commit"
+          git push https://${GH_PAT}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
