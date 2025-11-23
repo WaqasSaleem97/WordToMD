@@ -21,7 +21,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pandoc
 
-      - name: Convert DOCX to Markdown with image extraction
+      - name: Convert DOCX to Markdown with image extraction and cleanup
         run: |
           mkdir -p converted
           find . -type f -name "*.docx" -print0 | while IFS= read -r -d '' file; do
@@ -30,6 +30,8 @@ jobs:
               media_dir="converted/${filename}_media"
               mkdir -p "$media_dir"
               pandoc "$file" -f docx -t markdown -o "converted/${filename}.md" --extract-media="$media_dir"
+              # Remove Pandoc's image size attributes for GitHub compatibility
+              sed -i 's/{[^}]*}//g' "converted/${filename}.md"
             else
               echo "File not found: $file"
             fi
