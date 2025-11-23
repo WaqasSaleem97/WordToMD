@@ -21,23 +21,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pandoc
 
-      - name: Convert DOCX to Markdown
+      - name: Convert DOCX to Markdown with image extraction
         run: |
           mkdir -p converted
           find . -type f -name "*.docx" -print0 | while IFS= read -r -d '' file; do
             if [ -f "$file" ]; then
               filename=$(basename "$file" .docx)
-              pandoc "$file" -f docx -t markdown -o "converted/${filename}.md"
+              media_dir="converted/${filename}_media"
+              mkdir -p "$media_dir"
+              pandoc "$file" -f docx -t markdown -o "converted/${filename}.md" --extract-media="$media_dir"
             else
               echo "File not found: $file"
             fi
           done
 
-      - name: Commit and push converted files
+      - name: Commit and push converted files and media
         run: |
           git config --global user.name 'github-actions'
           git config --global user.email 'github-actions@github.com'
-          git add converted/*.md
-          git commit -m "Auto-converted DOCX to Markdown" || echo "No changes to commit"
+          git add converted/
+          git commit -m "Auto-converted DOCX to Markdown with images" || echo "No changes to commit"
           git push https://${{ secrets.GH_PAT }}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
-
