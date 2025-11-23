@@ -1,4 +1,3 @@
-# .github/workflows/convert-docx-to-md.yml
 name: Convert DOCX to Markdown (AST fix for image positions)
 
 on:
@@ -36,8 +35,7 @@ jobs:
               pandoc "../$file" -f docx -t json --extract-media="${filename}_media" -o "${filename}.json"
 
               # fix AST: move image-only/Raw img blocks after following paragraph
-              # CALL THE SCRIPT USING ../.github/scripts/... (one level up from converted -> repo root)
-              python3 ../.github/scripts/fix_pandoc_ast.py "${filename}.json" "${filename}.fixed.json"
+              python3 "${GITHUB_WORKSPACE}/.github/scripts/fix_pandoc_ast.py" "${filename}.json" "${filename}.fixed.json"
 
               # convert fixed JSON back to Markdown
               pandoc "${filename}.fixed.json" -f json -t gfm -o "${filename}.md"
@@ -45,6 +43,11 @@ jobs:
               # cleanup intermediate json files (optional)
               rm -f "${filename}.json" "${filename}.fixed.json"
             )
+
+            # <-- INSERTED HERE: run the markdown-level fixer to move any leading <img> or inline images
+            # Use absolute path to the script and pass the converted file path; do not fail the job if fixer returns non-zero.
+            python3 "${GITHUB_WORKSPACE}/.github/scripts/fix_md_images.py" "converted/${filename}.md" --inplace || true
+
           done
 
       - name: Commit and push converted files and media
