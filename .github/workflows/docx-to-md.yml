@@ -21,9 +21,9 @@ jobs:
       - name: Convert DOCX to Markdown
         run: |
           mkdir -p converted
-          for file in $(find . -name "*.docx"); do
+          find . -name "*.docx" -print0 | while IFS= read -r -d '' file; do
             filename=$(basename "$file" .docx)
-            pandoc "$file" -f docx -t markdown -o "converted/$filename.md"
+            pandoc "$file" -f docx -t markdown -o "converted/${filename}.md"
           done
 
       - name: Commit and push converted files
