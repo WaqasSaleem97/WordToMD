@@ -21,7 +21,7 @@ jobs:
       - name: Convert DOCX to Markdown
         run: |
           mkdir -p converted
-          find . -name "*.docx" -print0 | while IFS= read -r -d '' file; do
+          find . -type f -name "*.docx" -print0 | while IFS= read -r -d '' file; do
             filename=$(basename "$file" .docx)
             pandoc "$file" -f docx -t markdown -o "converted/${filename}.md"
           done
