@@ -1,4 +1,4 @@
-name: Convert PDF to Markdown with OCR (fallbacks)
+name: Convert PDF to Markdown (preserve inline images)
 
 on:
   push:
@@ -12,29 +12,25 @@ jobs:
   convert-pdf:
     runs-on: ubuntu-latest
     env:
-      OCR_LANG: "eng" # change if you need other language(s), e.g. "eng+spa"
-      DEBUG_KEEP_INTERMEDIATES: "false" # set to "true" to keep intermediate files for debugging
+      OCR_LANG: "eng"                      # change if you need other language(s), e.g. "eng+spa"
+      DEBUG_KEEP_INTERMEDIATES: "false"    # set to "true" to keep intermediate files for debugging
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Install tools (pandoc, poppler-utils, tesseract, ghostscript, qpdf, pip)
+      - name: Install tools (pandoc, poppler-utils, tesseract, ghostscript, pip)
         run: |
           sudo apt-get update
-          sudo apt-get install -y pandoc poppler-utils tesseract-ocr ghostscript qpdf python3-pip
+          sudo apt-get install -y pandoc poppler-utils tesseract-ocr ghostscript python3-pip
           python3 -m pip install --upgrade ocrmypdf
 
-      - name: Convert PDFs to Markdown (OCR fallback + image extraction)
+      - name: Convert PDFs to Markdown with inline images preserved
         run: |
           set -euo pipefail
           mkdir -p converted
           find . -type f -name "*.pdf" -print0 | while IFS= read -r -d '' file; do
-            if [ ! -f "$file" ]; then
-              echo "File not found: $file"
-              continue
-            fi
-
+            [ -f "$file" ] || { echo "File not found: $file"; continue; }
             filename=$(basename "$file" .pdf)
             echo "=== Processing $file -> converted/${filename}.md ==="
             mkdir -p "converted/${filename}_media"
@@ -42,79 +38,89 @@ jobs:
             (
               cd converted
 
-              # 1) Try quick text extraction with pdftotext (keep logs visible)
-              echo "Running pdftotext for ${filename}..."
-              pdftotext -layout "../$file" "${filename}.txt" || true
+              HTML_CREATED="false"
 
-              # 2) If no text, run OCR with ocrmypdf
-              if [ ! -s "${filename}.txt" ]; then
-                echo "No text from pdftotext; running ocrmypdf (OCR) on $file"
-                # --skip-text avoids OCR when text already exists; fine because we only get here when text is missing
-                ocrmypdf --skip-text --rotate-pages --deskew -l "${OCR_LANG}" "../$file" "${filename}_ocr.pdf" || true
+              # 1) Try pdftohtml -> HTML (keeps images inline)
+              echo "Trying pdftohtml on original PDF..."
+              if pdftohtml -c -s "../$file" "${filename}.html" >/dev/null 2>&1; then
+                echo "pdftohtml created ${filename}.html"
+                HTML_CREATED="true"
+              fi
+
+              # Normalize possible media directories (pdftohtml output variants)
+              for d in "${filename}.html_files" "${filename}_files" "${filename}-files" "${filename}_files"; do
+                [ -d "$d" ] && mv "$d" "${filename}_media"
+              done
+
+              # 2) If pdftohtml didn't produce HTML (likely scanned PDF), run OCR then retry pdftohtml
+              if [ "$HTML_CREATED" != "true" ]; then
+                echo "pdftohtml failed; trying OCR (ocrmypdf) and retrying pdftohtml..."
+                ocrmypdf --skip-text --rotate-pages --deskew -l "${OCR_LANG}" "../$file" "${filename}_ocr.pdf" >/dev/null 2>&1 || true
                 if [ -f "${filename}_ocr.pdf" ]; then
-                  echo "Extracting text from OCR'd PDF..."
-                  pdftotext -layout "${filename}_ocr.pdf" "${filename}.txt" || true
-                fi
-              fi
-
-              # 3) If still no text, rasterize pages and run tesseract page-by-page
-              if [ ! -s "${filename}.txt" ]; then
-                echo "OCR produced no text; rasterizing pages and running tesseract on images"
-                # pdftoppm will create files like ${filename}_page-1.png
-                pdftoppm -png -r 300 "../$file" "${filename}_page" || true
-                if ls "${filename}_page-"*.png >/dev/null 2>&1; then
-                  rm -f "${filename}_ocr_pages.txt" || true
-                  for img in "${filename}_page-"*.png; do
-                    outbase="${img%.*}"
-                    echo "Running tesseract on ${img} -> ${outbase}.txt"
-                    # tesseract syntax: tesseract input.png outputbase -l LANG
-                    tesseract "$img" "$outbase" -l "${OCR_LANG}" quiet || true
-                    txtfile="${outbase}.txt"
-                    if [ -f "${txtfile}" ]; then
-                      cat "${txtfile}" >> "${filename}_ocr_pages.txt"
-                      echo -e "\n\n" >> "${filename}_ocr_pages.txt"
-                    fi
-                  done
-                  if [ -s "${filename}_ocr_pages.txt" ]; then
-                    mv "${filename}_ocr_pages.txt" "${filename}.txt"
+                  if pdftohtml -c -s "${filename}_ocr.pdf" "${filename}.html" >/dev/null 2>&1; then
+                    echo "pdftohtml succeeded on OCR'd PDF"
+                    HTML_CREATED="true"
                   fi
+                  # normalize media dirs created by pdftohtml on OCR'd PDF
+                  for d in "${filename}.html_files" "${filename}_files" "${filename}-files" "${filename}_files"; do
+                    [ -d "$d" ] && mv "$d" "${filename}_media"
+                  done
                 else
-                  echo "No page images created by pdftoppm for ${filename}"
+                  echo "ocrmypdf did not create ${filename}_ocr.pdf (or it failed)."
                 fi
               fi
 
-              # 4) Extract embedded images regardless (pdfimages)
-              echo "Extracting embedded images with pdfimages (if any)"
-              pdfimages -all "../$file" "${filename}_media/image" || true
-
-              # 5) Create Markdown from text; if no text, put a note
-              if [ -s "${filename}.txt" ]; then
-                echo "Converting text to Markdown with pandoc..."
-                pandoc "${filename}.txt" -f markdown -t gfm -o "${filename}.md" || cp "${filename}.txt" "${filename}.md"
+              # 3) If we have HTML, convert to Markdown with pandoc (extract-media keeps images referenced inline)
+              if [ "$HTML_CREATED" = "true" ] && [ -f "${filename}.html" ]; then
+                echo "Converting HTML -> Markdown with pandoc (extract media into ${filename}_media)..."
+                pandoc "${filename}.html" -f html -t gfm -o "${filename}.md" --extract-media="${filename}_media" || true
+                # Remove the HTML file now that we've converted
+                rm -f "${filename}.html"
               else
-                echo "<!-- No text extracted from ${file} -->" > "${filename}.md"
+                # 4) Fallback: extract images and text separately (pdfimages + pdftotext), then append images
+                echo "FALLBACK: using pdfimages + pdftotext (images will be appended at end)"
+                pdftotext -layout "../$file" "${filename}.txt" >/dev/null 2>&1 || true
+                if [ ! -s "${filename}.txt" ] && [ -f "${filename}_ocr.pdf" ]; then
+                  # try extracting text from OCR'd PDF if available
+                  pdftotext -layout "${filename}_ocr.pdf" "${filename}.txt" >/dev/null 2>&1 || true
+                fi
+
+                pdfimages -all "../$file" "${filename}_media/image" >/dev/null 2>&1 || true
+
+                if [ -s "${filename}.txt" ]; then
+                  pandoc "${filename}.txt" -f markdown -t gfm -o "${filename}.md" || cp "${filename}.txt" "${filename}.md"
+                else
+                  echo "<!-- No text extracted from ${file} -->" > "${filename}.md"
+                fi
+
+                rm -f "${filename}.txt"
               fi
 
-              # 6) Append links for extracted images so they appear in the markdown
-              if ls "${filename}_media"/* >/dev/null 2>&1; then
-                echo -e "\n\n---\n\n### Extracted images\n" >> "${filename}.md"
-                for img in "${filename}_media"/*; do
-                  imgname=$(basename "$img")
-                  # Add a relative image link
-                  echo "![](${filename}_media/${imgname})" >> "${filename}.md"
-                done
-              fi
-
-              # 7) Clean Pandoc inline image attributes like {width="..."} (handles multi-line)
+              # 5) Clean Pandoc inline image attributes like {width="..."} (handles multi-line)
               if [ -f "${filename}.md" ]; then
                 perl -0777 -pe 's/!\[([^\]]*)\]\(([^)]+)\)\{[^}]+\}/![\1](\2)/gs' -i "${filename}.md" || true
               fi
 
-              # 8) Remove intermediates unless debug is enabled
+              # 6) Ensure any extracted images are referenced. If pandoc/html path already produced inline references, nothing to do.
+              #    For the fallback path we already wrote/are appending images at the end, but leave this here to ensure visibility.
+              if ls "${filename}_media"/* >/dev/null 2>&1; then
+                # Check whether images are already referenced in the markdown
+                if ! grep -q "${filename}_media/" "${filename}.md" >/dev/null 2>&1; then
+                  echo -e "\n\n---\n\n### Extracted images\n" >> "${filename}.md"
+                  for img in "${filename}_media"/*; do
+                    imgname=$(basename "$img")
+                    echo "![](${filename}_media/${imgname})" >> "${filename}.md"
+                  done
+                fi
+              fi
+
+              # 7) Remove intermediates unless debug is enabled
               if [ "${DEBUG_KEEP_INTERMEDIATES}" != "true" ]; then
-                rm -f "${filename}.txt" "${filename}_ocr.pdf" "${filename}_ocr_pages.txt" "${filename}_page-"*.png "${filename}_page-"*.png.txt || true
+                rm -f "${filename}_ocr.pdf" || true
+                # pdftohtml's extra dirs were moved to ${filename}_media above, remove any stray html_files if present
+                rm -rf "${filename}.html_files" "${filename}_files" "${filename}-files" || true
               else
-                echo "DEBUG_KEEP_INTERMEDIATES=true — keeping intermediate files for inspection"
+                echo "DEBUG_KEEP_INTERMEDIATES=true — keeping intermediate files in converted/ for inspection"
               fi
             )
 
@@ -128,5 +134,5 @@ jobs:
           git config --global user.name 'github-actions'
           git config --global user.email 'github-actions@github.com'
           git add converted/
-          git commit -m "Auto-converted PDFs to Markdown with OCR and images" || echo "No changes to commit"
+          git commit -m "Auto-converted PDFs to Markdown with inline images where possible" || echo "No changes to commit"
           git push https://${GH_PAT}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
