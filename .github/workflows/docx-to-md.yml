@@ -15,18 +15,20 @@ jobs:
       GITHUB_WORKSPACE: ${{ github.workspace }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Pre-check — exit early if no created/modified .docx in the push
+      - name: Pre-check — install jq and exit early if no created/modified .docx in the push
+        # Install jq first so parsing the event JSON won't fail when jq is missing.
         # This step runs BEFORE checkout to avoid doing heavy work when the push
-        # only removed .docx files. It reads the workflow event JSON (available
-        # as GITHUB_EVENT_PATH) and looks for commits[].added + commits[].modified
-        # containing .docx entries. If none are found, the step exits successfully
-        # and the job ends (no checkout, no pandoc).
+        # only removed .docx files. It inspects commits[].added + commits[].modified
+        # and exits early if there are no .docx entries (so deletions won't trigger conversion).
         run: |
           set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq
           EVENT_PATH="${GITHUB_EVENT_PATH:-/github/workflow/event.json}"
           echo "GITHUB_EVENT_PATH=${EVENT_PATH}"
           # Gather added + modified files from commits[] (safe if commits missing)
           added_modified="$(jq -r '.commits[] | (.added + .modified)[]?' "$EVENT_PATH" 2>/dev/null || true)"
+          echo "Files in commits[].added+modified (first 200 chars): ${added_modified:0:200}"
           has_docx=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
