@@ -41,21 +41,28 @@ jobs:
                 perl -0777 -pe 's/!\[([^\]]*)\]\(([^)]+)\)\{[^}]+\}/![\1](\2)/gs' -i "$mdfile" || true
               fi
 
-              # 2) Normalize HTML <img> tags to Markdown image syntax (double- and single-quoted src)
+              # 2) Normalize HTML <img> to Markdown ![](src) (double- and single-quoted src)
               if [ -f "$mdfile" ]; then
                 sed -E -i 's#<img[^>]*src="([^"]+)"[^>]*/?>#![](\1)#gI' "$mdfile" || true
                 sed -E -i "s#<img[^>]*src='([^']+)'[^>]*/?>#![](\1)#gI" "$mdfile" || true
               fi
 
-              # 3) Ensure each image is on its own paragraph (blank lines above and below)
+              # 3) Ensure each image is on its own paragraph (blank lines around)
               if [ -f "$mdfile" ]; then
                 perl -0777 -pe 's#\s*(\!\[[^\]]*\]\([^\)]+\))\s*#\n\n\1\n\n#g' -i "$mdfile" || true
               fi
 
-              # 4) Move images that appear immediately before a text block to after that block.
+              # 4) General swap: move images that appear immediately before a text block to after that block.
               #    Swap: IMAGE + TEXT_BLOCK  ->  TEXT_BLOCK + IMAGE
               if [ -f "$mdfile" ]; then
                 perl -0777 -pe '1 while s{(^|\n)(!\[[^\]]*\]\([^\)]+\))\s*([^\n].*?)(\n{2,}|\z)}{$1$3\n\n$2$4}gms' -i "$mdfile" || true
+              fi
+
+              # 5) SPECIFIC FIX: handle cases where an image is directly followed by a bold/strong paragraph
+              #    wrapped in triple asterisks (*** ... ***). This moves the image to after that ***...*** block.
+              #    It matches a Markdown image (from step 2) followed immediately by a ***...*** block (including newlines).
+              if [ -f "$mdfile" ]; then
+                perl -0777 -pe 's{(!\[[^\]]*\]\([^\)]+\))\s*(\*\*\*[\s\S]*?\*\*\*)}{$2\n\n$1}gsi' -i "$mdfile" || true
               fi
 
             else
