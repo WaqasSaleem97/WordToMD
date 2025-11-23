@@ -18,7 +18,7 @@ Fatima Jinnah Women University
 >
 > **CLASS: BSSE V-B**
 
-<img src="Zainab Shahid CC lab7_media/media/image1.jpeg" >
+> <img src="Zainab Shahid CC lab7_media/media/image1.jpeg" >
 
 **Task 1 — Print & filter environment variables**
 

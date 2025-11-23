@@ -18,7 +18,7 @@ Fatima Jinnah Women University
 >
 > **CLASS: BSSE V-B**
 
-<img src="Umber_media/media/image1.jpeg" >
+> <img src="Umber_media/media/image1.jpeg" >
 
 ***<u>Environment Variables, PATH, UFW, and SSH Key
 Authentication</u>***
