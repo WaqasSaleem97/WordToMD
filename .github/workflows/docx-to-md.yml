@@ -48,12 +48,12 @@ jobs:
           # 2) Fallback: if none found from event JSON, use git diff (null-delimited) to safely capture paths with spaces
           if [ ${#docx_files[@]} -eq 0 ]; then
             echo "No docx files found in event commits[]. Trying git diff between $BEFORE and $HEAD ..."
-            # git diff produces NUL-separated paths with -z
+            # git diff produces NUL-separated paths with -z; --diff-filter=AM ensures only Added/Modified (no Deleted)
             while IFS= read -r -d '' p; do
               case "${p,,}" in
                 *.docx) docx_files+=("$p") ;;
               esac
-            done < <(git diff --name-only -z "$BEFORE" "$HEAD" -- '*.docx' 2>/dev/null || printf '')
+            done < <(git diff --name-only -z --diff-filter=AM "$BEFORE" "$HEAD" -- '*.docx' 2>/dev/null || printf '')
           fi
 
           if [ ${#docx_files[@]} -eq 0 ]; then
