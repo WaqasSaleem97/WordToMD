@@ -30,8 +30,8 @@ jobs:
               media_dir="converted/${filename}_media"
               mkdir -p "$media_dir"
               pandoc "$file" -f docx -t markdown -o "converted/${filename}.md" --extract-media="$media_dir"
-              # Remove Pandoc's image size attributes for GitHub compatibility
-              sed -i 's/{[^}]*}//g' "converted/${filename}.md"
+              # Remove Pandoc image attributes like {width="..." height="..."}
+              sed -i -E 's/!\[(.*?)\]\((.*?)\)\{[^}]*\}/![\1](\2)/g' "converted/${filename}.md"
             else
               echo "File not found: $file"
             fi
@@ -42,5 +42,5 @@ jobs:
           git config --global user.name 'github-actions'
           git config --global user.email 'github-actions@github.com'
           git add converted/
-          git commit -m "Auto-converted DOCX to Markdown with images" || echo "No changes to commit"
+          git commit -m "Auto-converted DOCX to Markdown with cleaned image links" || echo "No changes to commit"
           git push https://${{ secrets.GH_PAT }}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
