@@ -1,4 +1,4 @@
-name: Convert DOCX to Markdown (debug, timeout & libreoffice fallback)
+name: Convert DOCX to Markdown
 
 on:
   push:
@@ -11,121 +11,62 @@ permissions:
 jobs:
   convert-docx:
     runs-on: ubuntu-latest
-    env:
-      DEBUG_KEEP_INTERMEDIATES: "false"   # set to "true" to keep logs and intermediates in converted/
-      PANDOC_TIMEOUT: "180"               # seconds; increase if you expect large docs
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Install tools (pandoc, libreoffice, poppler-utils)
+      - name: Set up Pandoc
         run: |
-          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y pandoc libreoffice-core libreoffice-writer poppler-utils
+          sudo apt-get install -y pandoc
 
-      - name: Convert DOCX to Markdown (debug + timeout + libreoffice fallback)
+      - name: Convert DOCX to Markdown with image extraction and cleanup
         run: |
           set -euo pipefail
-          set -x
           mkdir -p converted
-          find . -type f -iname "*.docx" -print0 | while IFS= read -r -d '' file; do
-            [ -f "$file" ] || { echo "File not found: $file"; continue; }
-            filename=$(basename "$file" .docx)
-            echo "=== Processing: $file -> converted/${filename}.md ==="
+          find . -type f -name "*.docx" -print0 | while IFS= read -r -d '' file; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file" .docx)
+              echo "Converting: $file -> converted/${filename}.md"
+              # Run pandoc from inside converted/ so media paths are relative to the .md file.
+              (
+                cd converted
+                pandoc "../$file" -f docx -t gfm -o "${filename}.md" --extract-media="${filename}_media"
+              )
+              mdfile="converted/${filename}.md"
 
-            # debug info about the source file
-            echo "File size (bytes): $(stat -c%s "$file" || true)"
-            echo "Head (first 512 bytes):"
-            head -c 512 "$file" | hexdump -C | sed -n '1,20p' || true
-            echo "Tail (last 512 bytes):"
-            tail -c 512 "$file" | hexdump -C | sed -n '1,20p' || true
-
-            # prepare log path
-            PLOG="../converted_${filename}.pandoc.log"
-            rm -f "$PLOG" || true
-
-            # 1) Run pandoc with timeout and verbose, capture stderr to log
-            (
-              cd converted
-              echo "Running pandoc (timeout ${PANDOC_TIMEOUT}s) ..."
-              # timeout will kill pandoc if it exceeds PANDOC_TIMEOUT
-              timeout "${PANDOC_TIMEOUT}s" pandoc --verbose "../$file" -f docx -t gfm -o "${filename}.md" --extract-media="${filename}_media" 2> "$PLOG" || echo "pandoc exited with status $?"
-            )
-
-            # show pandoc log (last 200 lines)
-            if [ -f "converted_${filename}.pandoc.log" ]; then
-              echo "---- pandoc log (tail 200) for ${filename} ----"
-              tail -n 200 "converted_${filename}.pandoc.log" || true
-            fi
-
-            # quick checks: md presence and media dir
-            echo "MD file exists?"; ls -l "converted/${filename}.md" || true
-            echo "Media dir contents:"; ls -la "converted/${filename}_media" || true
-
-            # 2) If pandoc produced no md (or empty), try LibreOffice re-save and retry
-            if [ ! -s "converted/${filename}.md" ]; then
-              echo "Pandoc did not produce a non-empty markdown file; attempting LibreOffice repair/resave and retry..."
-              # create a repaired copy in /tmp to avoid name collisions
-              TMP_REPAIRED="/tmp/${filename}_repaired.docx"
-              rm -f "$TMP_REPAIRED" || true
-              # LibreOffice headless convert: it writes to the current dir, so set cwd to /tmp
-              soffice --headless --convert-to docx --outdir /tmp "$file" || echo "libreoffice convert returned non-zero"
-              if [ -f "$TMP_REPAIRED" ]; then
-                echo "Repaired file created: $TMP_REPAIRED (size: $(stat -c%s "$TMP_REPAIRED"))"
-                # try pandoc again on repaired file
-                PLOG="../converted_${filename}_repaired.pandoc.log"
-                (
-                  cd converted
-                  timeout "${PANDOC_TIMEOUT}s" pandoc --verbose "$TMP_REPAIRED" -f docx -t gfm -o "${filename}.md" --extract-media="${filename}_media" 2> "$PLOG" || echo "pandoc (repaired) exited with status $?"
-                )
-                if [ -f "converted_${filename}_repaired.pandoc.log" ]; then
-                  echo "---- pandoc (repaired) log (tail 200) ----"
-                  tail -n 200 "converted_${filename}_repaired.pandoc.log" || true
-                fi
-              else
-                echo "LibreOffice failed to produce a repaired docx for ${file}"
+              # Remove Pandoc image attributes like {width="..." height="..."} (handles multi-line attributes)
+              if [ -f "$mdfile" ]; then
+                perl -0777 -pe 's/!\[([^\]]*)\]\(([^)]+)\)\{[^}]+\}/![\1](\2)/gs' -i "$mdfile" || true
               fi
-            fi
 
-            # 3) Post-process if markdown created: normalize images and move misplaced images
-            mdfile="converted/${filename}.md"
-            if [ -f "$mdfile" ] && [ -s "$mdfile" ]; then
-              echo "Post-processing ${mdfile} (strip pandoc attrs, normalize <img>, reorder images)..."
-              # remove Pandoc attribute blocks
-              perl -0777 -pe 's/!\[([^\]]*)\]\(([^)]+)\)\{[^}]+\}/![\1](\2)/gs' -i "$mdfile" || true
-              # convert <img ... src="..."> to markdown ![](src)
-              perl -0777 -pe 's#<img[^>]*\ssrc=(["'\''])([^"'\''>]+)\1[^>]*\/?>#![](\2)#gsi' -i "$mdfile" || true
-              # move images that are immediately before a paragraph to after that paragraph
-              perl -0777 -pe '1 while s{(^|\n)(!\[[^\]]*\]\([^\)]+\))\s*([^\n].*?)(\n{2,}|\z)}{$1$3\n\n$2$4}gms' -i "$mdfile" || true
-              echo "Post-process done. Show head of file:"
-              sed -n '1,120p' "$mdfile" || true
+              # Normalize any HTML <img ... src="..."> or <img ... src='...'> to Markdown ![](src)
+              if [ -f "$mdfile" ]; then
+                sed -E -i 's#<img[^>]*src="([^"]+)"[^>]*\/?>#![](\1)#gI' "$mdfile" || true
+                sed -E -i "s#<img[^>]*src='([^']+)'[^>]*\/?>#![](\1)#gI" "$mdfile" || true
+              fi
+
+              # Ensure each image is on its own paragraph (blank lines around)
+              if [ -f "$mdfile" ]; then
+                perl -0777 -pe 's#\s*(\!\[[^\]]*\]\([^\)]+\))\s*#\n\n\1\n\n#g' -i "$mdfile" || true
+              fi
+
+              # Move images that appear immediately before a text block to after that block.
+              # This swaps: IMAGE + TEXT_BLOCK  -> TEXT_BLOCK + IMAGE
+              if [ -f "$mdfile" ]; then
+                perl -0777 -pe '1 while s{(^|\n)(!\[[^\]]*\]\([^\)]+\))\s*([^\n].*?)(\n{2,}|\z)}{$1$3\n\n$2$4}gms' -i "$mdfile" || true
+              fi
+
             else
-              echo "No markdown produced for ${filename} after retries."
+              echo "File not found: $file"
             fi
-
-            # 4) keep or remove intermediates based on DEBUG_KEEP_INTERMEDIATES
-            if [ "${DEBUG_KEEP_INTERMEDIATES}" != "true" ]; then
-              rm -f "converted_${filename}.pandoc.log" "converted_${filename}_repaired.pandoc.log" || true
-              rm -f "$TMP_REPAIRED" || true
-            else
-              echo "DEBUG_KEEP_INTERMEDIATES=true — leaving logs and repaired files in converted/ root for inspection."
-              mv -f "converted_${filename}.pandoc.log" converted/ || true
-              mv -f "converted_${filename}_repaired.pandoc.log" converted/ || true
-              [ -f "$TMP_REPAIRED" ] && mv -f "$TMP_REPAIRED" converted/ || true
-            fi
-
           done
 
-      - name: Commit and push converted files and media (if any)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Commit and push converted files and media
         run: |
-          set -euo pipefail
           git config --global user.name 'github-actions'
           git config --global user.email 'github-actions@github.com'
-          git add converted/ || true
-          git commit -m "Auto-convert DOCX -> Markdown (debug run)" || echo "No changes to commit"
-          BRANCH="${GITHUB_REF#refs/heads/}"
-          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}" "HEAD:${BRANCH}" || echo "Push failed; check permissions"
+          git add converted/
+          git commit -m "Auto-converted DOCX to Markdown with cleaned image links" || echo "No changes to commit"
+          git push https://${{ secrets.GH_PAT }}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
