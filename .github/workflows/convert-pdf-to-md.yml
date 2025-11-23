@@ -1,4 +1,4 @@
-name: Convert PDF to Markdown (preserve inline images)
+name: Convert PDF to Markdown (pdf2htmlEX + inline images via markdownify)
 
 on:
   push:
@@ -19,13 +19,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Install tools (pandoc, poppler-utils, tesseract, ghostscript, pip)
+      - name: Install tools (pdf2htmlEX, pandoc, poppler-utils, tesseract, ocrmypdf)
         run: |
           sudo apt-get update
-          sudo apt-get install -y pandoc poppler-utils tesseract-ocr ghostscript python3-pip
-          python3 -m pip install --upgrade ocrmypdf
+          # pdf2htmlEX is best for preserving layout and inline <img> positions; install if available.
+          sudo apt-get install -y pdf2htmlEX pandoc poppler-utils tesseract-ocr python3-pip ghostscript qpdf || true
+          python3 -m pip install --upgrade ocrmypdf markdownify beautifulsoup4 lxml
 
-      - name: Convert PDFs to Markdown with inline images preserved
+      - name: Convert PDFs to Markdown with inline images (uses pdf2htmlEX + markdownify)
         run: |
           set -euo pipefail
           mkdir -p converted
@@ -38,53 +39,159 @@ jobs:
             (
               cd converted
 
-              HTML_CREATED="false"
+              HTML_OK="false"
+              HTML_NAME="${filename}.html"
 
-              # 1) Try pdftohtml -> HTML (keeps images inline)
-              echo "Trying pdftohtml on original PDF..."
-              if pdftohtml -c -s "../$file" "${filename}.html" >/dev/null 2>&1; then
-                echo "pdftohtml created ${filename}.html"
-                HTML_CREATED="true"
-              fi
-
-              # Normalize possible media directories (pdftohtml output variants)
-              for d in "${filename}.html_files" "${filename}_files" "${filename}-files" "${filename}_files"; do
-                [ -d "$d" ] && mv "$d" "${filename}_media"
-              done
-
-              # 2) If pdftohtml didn't produce HTML (likely scanned PDF), run OCR then retry pdftohtml
-              if [ "$HTML_CREATED" != "true" ]; then
-                echo "pdftohtml failed; trying OCR (ocrmypdf) and retrying pdftohtml..."
-                ocrmypdf --skip-text --rotate-pages --deskew -l "${OCR_LANG}" "../$file" "${filename}_ocr.pdf" >/dev/null 2>&1 || true
-                if [ -f "${filename}_ocr.pdf" ]; then
-                  if pdftohtml -c -s "${filename}_ocr.pdf" "${filename}.html" >/dev/null 2>&1; then
-                    echo "pdftohtml succeeded on OCR'd PDF"
-                    HTML_CREATED="true"
-                  fi
-                  # normalize media dirs created by pdftohtml on OCR'd PDF
-                  for d in "${filename}.html_files" "${filename}_files" "${filename}-files" "${filename}_files"; do
-                    [ -d "$d" ] && mv "$d" "${filename}_media"
-                  done
+              # 1) Prefer pdf2htmlEX (better at preserving layout and inline img placement)
+              if command -v pdf2htmlEX >/dev/null 2>&1; then
+                echo "Running pdf2htmlEX on ${file}"
+                # --embed cfijo ensures images/fonts are extracted as files
+                if pdf2htmlEX --embed cfijo "../$file" "${HTML_NAME}" >/dev/null 2>&1; then
+                  echo "pdf2htmlEX succeeded for ${filename}"
+                  HTML_OK="true"
                 else
-                  echo "ocrmypdf did not create ${filename}_ocr.pdf (or it failed)."
+                  echo "pdf2htmlEX failed for ${filename}"
+                fi
+              else
+                echo "pdf2htmlEX not found; falling back to pdftohtml"
+              fi
+
+              # 2) Fallback to pdftohtml if pdf2htmlEX failed
+              if [ "$HTML_OK" != "true" ]; then
+                echo "Trying pdftohtml for ${file}"
+                # -c (complex output with CSS) -s (single page per file) could be used; here allow multi-page html
+                if pdftohtml -c -i "../$file" "${filename}.html" >/dev/null 2>&1; then
+                  echo "pdftohtml produced ${filename}.html"
+                  HTML_OK="true"
+                else
+                  echo "pdftohtml failed to produce usable HTML for ${filename}"
                 fi
               fi
 
-              # 3) If we have HTML, convert to Markdown with pandoc (extract-media keeps images referenced inline)
-              if [ "$HTML_CREATED" = "true" ] && [ -f "${filename}.html" ]; then
-                echo "Converting HTML -> Markdown with pandoc (extract media into ${filename}_media)..."
-                pandoc "${filename}.html" -f html -t gfm -o "${filename}.md" --extract-media="${filename}_media" || true
-                # Remove the HTML file now that we've converted
-                rm -f "${filename}.html"
-              else
-                # 4) Fallback: extract images and text separately (pdfimages + pdftotext), then append images
-                echo "FALLBACK: using pdfimages + pdftotext (images will be appended at end)"
-                pdftotext -layout "../$file" "${filename}.txt" >/dev/null 2>&1 || true
-                if [ ! -s "${filename}.txt" ] && [ -f "${filename}_ocr.pdf" ]; then
-                  # try extracting text from OCR'd PDF if available
-                  pdftotext -layout "${filename}_ocr.pdf" "${filename}.txt" >/dev/null 2>&1 || true
+              # 3) If HTML exists, convert HTML -> Markdown preserving inline image placement using python markdownify
+              if [ "$HTML_OK" = "true" ] && [ -f "${HTML_NAME}" ]; then
+                echo "Preparing HTML assets and converting to Markdown via markdownify..."
+
+                # Move any html resource directories (e.g. name_files, name.html_files, name_files) into our _media dir
+                for d in "${filename}.html_files" "${filename}_files" "${filename}-files" "${filename}_files" "${filename}.files"; do
+                  if [ -d "$d" ]; then
+                    mv "$d" "${filename}_media" || true
+                  fi
+                done
+
+                # Many converters produce resources in a folder named like filename_files or filename_files; also check for resources matching pattern
+                for resdir in ./*"$filename"*"_files" ./*"$filename"*"_files" ./*"$filename"*"-files" 2>/dev/null; do
+                  [ -d "$resdir" ] && mv "$resdir" "${filename}_media" 2>/dev/null || true
+                done
+
+                # Use a python script to:
+                #  - rewrite <img> src attributes to point into ${filename}_media (move/copy files if necessary)
+                #  - convert the final HTML to Markdown using markdownify (which preserves inline img locations)
+                python3 - <<PY
+import os, shutil, sys, pathlib
+from bs4 import BeautifulSoup
+from markdownify import markdownify as md
+
+fn = "${HTML_NAME}"
+media_dir = "${filename}_media"
+# read html
+with open(fn, "rb") as f:
+    data = f.read()
+# try decoding
+try:
+    html = data.decode("utf-8")
+except:
+    try:
+        html = data.decode("latin-1")
+    except:
+        html = data.decode("utf-8", "ignore")
+
+soup = BeautifulSoup(html, "lxml")
+
+# Process images: ensure src points to media_dir/<basename> and move files if necessary
+for img in soup.find_all("img"):
+    src = img.get("src")
+    if not src:
+        continue
+    src_path = pathlib.Path(src)
+    # If src is an absolute URL, leave it.
+    if src.startswith("http://") or src.startswith("https://") or src.startswith("data:"):
+        continue
+    # If src references something inside a sibling resource directory, locate and move it
+    possible_paths = []
+    # src may be like "filename_files/image.png" or "./filename_files/image.png" or "image.png"
+    possible_paths.append(pathlib.Path(src))
+    possible_paths.append(pathlib.Path(fn).with_name(src))
+    # also check root (converted dir) for directories named like filename_files or *_files
+    for candidate in possible_paths:
+        if candidate.exists():
+            src_file = candidate
+            break
+    else:
+        # try searching for the file anywhere in cwd/_media candidates
+        matches = list(pathlib.Path(".").rglob(src_path.name))
+        if matches:
+            src_file = matches[0]
+        else:
+            src_file = None
+
+    if src_file:
+        dest_dir = pathlib.Path(media_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / src_file.name
+        try:
+            if src_file.resolve() != dest.resolve():
+                shutil.move(str(src_file), str(dest))
+        except Exception:
+            # if move fails, try copy
+            try:
+                shutil.copy2(str(src_file), str(dest))
+            except Exception:
+                pass
+        # set img src to relative media path
+        img['src'] = f"{media_dir}/{src_file.name}"
+    else:
+        # leave src as-is but normalize path
+        img['src'] = src.replace("./", "")
+
+# Some HTML outputs contain absolute-positioned DIVs; markdownify will preserve order of elements in the DOM.
+# Convert to markdown
+md_text = md(str(soup), heading_style="ATX")
+
+out_md = "${filename}.md"
+with open(out_md, "w", encoding="utf-8") as out:
+    out.write(md_text)
+
+print("WROTE:", out_md)
+PY
+
+                # Remove the HTML if not debugging
+                if [ "${DEBUG_KEEP_INTERMEDIATES}" != "true" ]; then
+                  rm -f "${HTML_NAME}" || true
+                else
+                  echo "Keeping HTML for inspection due to DEBUG_KEEP_INTERMEDIATES=true"
                 fi
 
+                # Remove any Pandoc style attributes if they exist (defensive)
+                if [ -f "${filename}.md" ]; then
+                  perl -0777 -pe 's/!\[([^\]]*)\]\(([^)]+)\)\{[^}]+\}/![\1](\2)/gs' -i "${filename}.md" || true
+                fi
+
+              else
+                # 4) If HTML path failed, fallback to OCR + text + images (images will be appended)
+                echo "HTML conversion failed; falling back to OCR/text + pdfimages (images appended at end)"
+
+                pdftotext -layout "../$file" "${filename}.txt" >/dev/null 2>&1 || true
+
+                if [ ! -s "${filename}.txt" ]; then
+                  echo "Running ocrmypdf as fallback OCR..."
+                  python3 -m ocrmypdf --skip-text --rotate-pages --deskew -l "${OCR_LANG}" "../$file" "${filename}_ocr.pdf" >/dev/null 2>&1 || true
+                  if [ -f "${filename}_ocr.pdf" ]; then
+                    pdftotext -layout "${filename}_ocr.pdf" "${filename}.txt" >/dev/null 2>&1 || true
+                  fi
+                fi
+
+                # extract embedded images
                 pdfimages -all "../$file" "${filename}_media/image" >/dev/null 2>&1 || true
 
                 if [ -s "${filename}.txt" ]; then
@@ -93,34 +200,24 @@ jobs:
                   echo "<!-- No text extracted from ${file} -->" > "${filename}.md"
                 fi
 
-                rm -f "${filename}.txt"
-              fi
-
-              # 5) Clean Pandoc inline image attributes like {width="..."} (handles multi-line)
-              if [ -f "${filename}.md" ]; then
-                perl -0777 -pe 's/!\[([^\]]*)\]\(([^)]+)\)\{[^}]+\}/![\1](\2)/gs' -i "${filename}.md" || true
-              fi
-
-              # 6) Ensure any extracted images are referenced. If pandoc/html path already produced inline references, nothing to do.
-              #    For the fallback path we already wrote/are appending images at the end, but leave this here to ensure visibility.
-              if ls "${filename}_media"/* >/dev/null 2>&1; then
-                # Check whether images are already referenced in the markdown
-                if ! grep -q "${filename}_media/" "${filename}.md" >/dev/null 2>&1; then
+                # append images at end for fallback
+                if ls "${filename}_media"/* >/dev/null 2>&1; then
                   echo -e "\n\n---\n\n### Extracted images\n" >> "${filename}.md"
                   for img in "${filename}_media"/*; do
                     imgname=$(basename "$img")
                     echo "![](${filename}_media/${imgname})" >> "${filename}.md"
                   done
                 fi
+
+                rm -f "${filename}.txt" "${filename}_ocr.pdf" || true
               fi
 
-              # 7) Remove intermediates unless debug is enabled
+              # final cleanup unless debugging
               if [ "${DEBUG_KEEP_INTERMEDIATES}" != "true" ]; then
-                rm -f "${filename}_ocr.pdf" || true
-                # pdftohtml's extra dirs were moved to ${filename}_media above, remove any stray html_files if present
-                rm -rf "${filename}.html_files" "${filename}_files" "${filename}-files" || true
+                # remove stray resource dirs left behind by pdftohtml/pdf2htmlEX
+                rm -rf "${filename}.html_files" "${filename}_files" "${filename}-files" "${filename}.files" 2>/dev/null || true
               else
-                echo "DEBUG_KEEP_INTERMEDIATES=true — keeping intermediate files in converted/ for inspection"
+                echo "DEBUG_KEEP_INTERMEDIATES=true — keeping intermediates for inspection"
               fi
             )
 
@@ -134,5 +231,5 @@ jobs:
           git config --global user.name 'github-actions'
           git config --global user.email 'github-actions@github.com'
           git add converted/
-          git commit -m "Auto-converted PDFs to Markdown with inline images where possible" || echo "No changes to commit"
+          git commit -m "Auto-converted PDFs to Markdown with inline images (pdf2htmlEX + markdownify)" || echo "No changes to commit"
           git push https://${GH_PAT}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
