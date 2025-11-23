@@ -42,47 +42,54 @@ jobs:
             (
               cd converted
 
-              # 1) Try quick text extraction
-              pdftotext -layout "../$file" "${filename}.txt" >/dev/null 2>&1 || true
+              # 1) Try quick text extraction with pdftotext (keep logs visible)
+              echo "Running pdftotext for ${filename}..."
+              pdftotext -layout "../$file" "${filename}.txt" || true
 
               # 2) If no text, run OCR with ocrmypdf
               if [ ! -s "${filename}.txt" ]; then
                 echo "No text from pdftotext; running ocrmypdf (OCR) on $file"
-                ocrmypdf --skip-text --rotate-pages --deskew -l "${OCR_LANG}" "../$file" "${filename}_ocr.pdf" >/dev/null 2>&1 || true
+                # --skip-text avoids OCR when text already exists; fine because we only get here when text is missing
+                ocrmypdf --skip-text --rotate-pages --deskew -l "${OCR_LANG}" "../$file" "${filename}_ocr.pdf" || true
                 if [ -f "${filename}_ocr.pdf" ]; then
-                  pdftotext -layout "${filename}_ocr.pdf" "${filename}.txt" >/dev/null 2>&1 || true
+                  echo "Extracting text from OCR'd PDF..."
+                  pdftotext -layout "${filename}_ocr.pdf" "${filename}.txt" || true
                 fi
               fi
 
               # 3) If still no text, rasterize pages and run tesseract page-by-page
               if [ ! -s "${filename}.txt" ]; then
                 echo "OCR produced no text; rasterizing pages and running tesseract on images"
-                # Produce PNGs at 300 DPI
-                pdftoppm -png -r 300 "../$file" "${filename}_page" >/dev/null 2>&1 || true
-                # If we produced page images, run tesseract on each
-                if ls "${filename}_page"*.png >/dev/null 2>&1; then
+                # pdftoppm will create files like ${filename}_page-1.png
+                pdftoppm -png -r 300 "../$file" "${filename}_page" || true
+                if ls "${filename}_page-"*.png >/dev/null 2>&1; then
                   rm -f "${filename}_ocr_pages.txt" || true
-                  for img in "${filename}_page"*.png; do
-                    # tesseract outputs txt named like img.txt
-                    tesseract "$img" "$img" -l "${OCR_LANG}" quiet || true
-                    # tesseract creates ${img}.txt (without extension conflict): e.g. file-page-1.png.txt
-                    if [ -f "${img}.txt" ]; then
-                      cat "${img}.txt" >> "${filename}_ocr_pages.txt"
+                  for img in "${filename}_page-"*.png; do
+                    outbase="${img%.*}"
+                    echo "Running tesseract on ${img} -> ${outbase}.txt"
+                    # tesseract syntax: tesseract input.png outputbase -l LANG
+                    tesseract "$img" "$outbase" -l "${OCR_LANG}" quiet || true
+                    txtfile="${outbase}.txt"
+                    if [ -f "${txtfile}" ]; then
+                      cat "${txtfile}" >> "${filename}_ocr_pages.txt"
                       echo -e "\n\n" >> "${filename}_ocr_pages.txt"
                     fi
                   done
                   if [ -s "${filename}_ocr_pages.txt" ]; then
                     mv "${filename}_ocr_pages.txt" "${filename}.txt"
                   fi
+                else
+                  echo "No page images created by pdftoppm for ${filename}"
                 fi
               fi
 
               # 4) Extract embedded images regardless (pdfimages)
               echo "Extracting embedded images with pdfimages (if any)"
-              pdfimages -all "../$file" "${filename}_media/image" >/dev/null 2>&1 || true
+              pdfimages -all "../$file" "${filename}_media/image" || true
 
               # 5) Create Markdown from text; if no text, put a note
               if [ -s "${filename}.txt" ]; then
+                echo "Converting text to Markdown with pandoc..."
                 pandoc "${filename}.txt" -f markdown -t gfm -o "${filename}.md" || cp "${filename}.txt" "${filename}.md"
               else
                 echo "<!-- No text extracted from ${file} -->" > "${filename}.md"
@@ -99,12 +106,13 @@ jobs:
               fi
 
               # 7) Clean Pandoc inline image attributes like {width="..."} (handles multi-line)
-              perl -0777 -pe 's/!\[([^\]]*)\]\(([^)]+)\)\{[^}]+\}/![\1](\2)/gs' -i "${filename}.md" || true
+              if [ -f "${filename}.md" ]; then
+                perl -0777 -pe 's/!\[([^\]]*)\]\(([^)]+)\)\{[^}]+\}/![\1](\2)/gs' -i "${filename}.md" || true
+              fi
 
-              # 8) Remove some intermediates unless debug is enabled
+              # 8) Remove intermediates unless debug is enabled
               if [ "${DEBUG_KEEP_INTERMEDIATES}" != "true" ]; then
-                rm -f "${filename}.txt" "${filename}_ocr.pdf" "${filename}_ocr_pages.txt" "${filename}_page"*.png "${filename}_page"*.png.txt || true
-                # pdftohtml html or files are not created in this flow; if you add pdftohtml, clean here too
+                rm -f "${filename}.txt" "${filename}_ocr.pdf" "${filename}_ocr_pages.txt" "${filename}_page-"*.png "${filename}_page-"*.png.txt || true
               else
                 echo "DEBUG_KEEP_INTERMEDIATES=true — keeping intermediate files for inspection"
               fi
