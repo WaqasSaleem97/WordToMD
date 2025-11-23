@@ -31,8 +31,7 @@ jobs:
               mkdir -p "$media_dir"
               pandoc "$file" -f docx -t markdown -o "converted/${filename}.md" --extract-media="$media_dir"
               # Remove Pandoc image attributes like {width="..." height="..."}
-              awk 'BEGIN{RS=""; ORS="\n\n"} {gsub(/\n\{[^}]+\}/, ""); print}' "converted/${filename}.md" > "converted/${filename}_cleaned.md"
-              mv "converted/${filename}_cleaned.md" "converted/${filename}.md"
+              sed -i -E 's/!\[([^\]]*)\]\(([^)]+)\)\{[^}]+\}/![\1](\2)/g' "converted/${filename}.md"
             else
               echo "File not found: $file"
             fi
