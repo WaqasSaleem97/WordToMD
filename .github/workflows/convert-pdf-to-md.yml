@@ -1,0 +1,78 @@
+name: Convert PDF to Markdown
+
+on:
+  push:
+    paths:
+      - '**/*.pdf'
+
+permissions:
+  contents: write
+
+jobs:
+  convert-pdf:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install tools (pandoc + poppler-utils)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc poppler-utils
+
+      - name: Convert PDFs to Markdown (extract images)
+        run: |
+          mkdir -p converted
+          find . -type f -name "*.pdf" -print0 | while IFS= read -r -d '' file; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file" .pdf)
+              echo "Processing $file -> converted/${filename}.md"
+              mkdir -p "converted/${filename}_media"
+              (
+                cd converted
+
+                # Try pdftohtml -> HTML with images
+                if pdftohtml -c -s "../$file" "${filename}.html" >/dev/null 2>&1; then
+                  echo "pdftohtml succeeded for $file"
+                  # pdftohtml may create a directory like name.html_files or name_files - normalize to _media
+                  if [ -d "${filename}.html_files" ]; then mv "${filename}.html_files" "${filename}_media"; fi
+                  if [ -d "${filename}_files" ]; then mv "${filename}_files" "${filename}_media"; fi
+                  if [ -d "${filename}-files" ]; then mv "${filename}-files" "${filename}_media"; fi
+
+                  # Convert HTML to Markdown, telling pandoc to extract media into the _media folder
+                  pandoc "${filename}.html" -f html -t gfm -o "${filename}.md" --extract-media="${filename}_media" || true
+                else
+                  echo "pdftohtml failed or produced no HTML; falling back to pdfimages + pdftotext"
+                  # Fallback: extract images and text separately
+                  pdfimages -all "../$file" "${filename}_media/image" || true
+                  pdftotext -layout "../$file" "${filename}.txt" || true
+                  if [ -f "${filename}.txt" ]; then
+                    # Convert the text file into markdown (basic)
+                    pandoc "${filename}.txt" -f markdown -t gfm -o "${filename}.md" || cp "${filename}.txt" "${filename}.md"
+                  else
+                    echo "Warning: no text extracted for $file"
+                    # Create an empty md with note
+                    echo "<!-- No text extracted from ${file} -->" > "${filename}.md"
+                  fi
+                fi
+
+                # Remove Pandoc inline image attributes like {width="..." height="..."} even if multi-line
+                if [ -f "${filename}.md" ]; then
+                  perl -0777 -pe 's/!\[([^\]]*)\]\(([^)]+)\)\{[^}]+\}/![\1](\2)/gs' -i "${filename}.md" || true
+                fi
+              )
+            else
+              echo "File not found: $file"
+            fi
+          done
+
+      - name: Commit and push converted files and media
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          git config --global user.name 'github-actions'
+          git config --global user.email 'github-actions@github.com'
+          git add converted/
+          git commit -m "Auto-converted PDFs to Markdown with images" || echo "No changes to commit"
+          git push https://${GH_PAT}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
