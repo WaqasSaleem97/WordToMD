@@ -12,12 +12,36 @@ jobs:
   convert-docx:
     runs-on: ubuntu-latest
     env:
-      BEFORE: ${{ github.event.before }}
-      HEAD: ${{ github.sha }}
       GITHUB_WORKSPACE: ${{ github.workspace }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
     steps:
+      - name: Pre-check — exit early if no created/modified .docx in the push
+        # This step runs BEFORE checkout to avoid doing heavy work when the push
+        # only removed .docx files. It reads the workflow event JSON (available
+        # as GITHUB_EVENT_PATH) and looks for commits[].added + commits[].modified
+        # containing .docx entries. If none are found, the step exits successfully
+        # and the job ends (no checkout, no pandoc).
+        run: |
+          set -euo pipefail
+          EVENT_PATH="${GITHUB_EVENT_PATH:-/github/workflow/event.json}"
+          echo "GITHUB_EVENT_PATH=${EVENT_PATH}"
+          # Gather added + modified files from commits[] (safe if commits missing)
+          added_modified="$(jq -r '.commits[] | (.added + .modified)[]?' "$EVENT_PATH" 2>/dev/null || true)"
+          has_docx=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "${f,,}" in
+              *.docx) has_docx=true; break ;;
+            esac
+          done <<EOF
+$added_modified
+EOF
+          if [ "$has_docx" = "false" ]; then
+            echo "No added/modified .docx files found in event commits[]. Exiting early (this avoids running on deletions)."
+            exit 0
+          fi
+          echo "Found added/modified .docx in event commits[]. Proceeding with conversion."
+
       - name: Checkout repository (full history required for diffs)
         uses: actions/checkout@v3
         with:
@@ -47,7 +71,9 @@ jobs:
 
           # 2) Fallback: if none found from event JSON, use git diff (null-delimited) to safely capture paths with spaces
           if [ ${#docx_files[@]} -eq 0 ]; then
-            echo "No docx files found in event commits[]. Trying git diff between $BEFORE and $HEAD ..."
+            echo "No docx files found in event commits[]. Trying git diff between ${{ github.event.before }} and ${{ github.sha }} ..."
+            BEFORE="${{ github.event.before }}"
+            HEAD="${{ github.sha }}"
             # git diff produces NUL-separated paths with -z; --diff-filter=AM ensures only Added/Modified (no Deleted)
             while IFS= read -r -d '' p; do
               case "${p,,}" in
