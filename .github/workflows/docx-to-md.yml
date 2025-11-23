@@ -1,4 +1,4 @@
-name: Convert DOCX to Markdown (changed files only, produce md next to docx, images in <name>/images)
+name: Convert DOCX to Markdown (changed files only, place md next to docx, images in <name>/images)
 
 on:
   push:
@@ -12,10 +12,10 @@ jobs:
   convert-docx:
     runs-on: ubuntu-latest
     env:
-      # expose values for git diff fallback
       BEFORE: ${{ github.event.before }}
       HEAD: ${{ github.sha }}
       GITHUB_WORKSPACE: ${{ github.workspace }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout repository (full history required for diffs)
@@ -26,38 +26,48 @@ jobs:
       - name: Install pandoc and python
         run: |
           sudo apt-get update
-          sudo apt-get install -y pandoc python3 python3-pip
+          sudo apt-get install -y pandoc python3 python3-pip jq
 
       - name: Convert changed/added DOCX files only, write md next to docx and images in <name>/images
         run: |
           set -euo pipefail
-          # Collect changed/added .docx files from the push event first (commits[].added and commits[].modified)
           EVENT_PATH="${GITHUB_EVENT_PATH:-/github/workflow/event.json}"
           echo "GITHUB_EVENT_PATH=$EVENT_PATH"
-          changed_files="$(jq -r '.commits[] | (.added + .modified)[]?' "$EVENT_PATH" 2>/dev/null || true)"
-          # filter docx files (case-insensitive)
-          docx_files=$(printf '%s\n' "$changed_files" | grep -iE '\.docx$' || true)
 
-          # If no docx from commits[], fallback to git diff between BEFORE and HEAD (handles pushes where commits array isn't present)
-          if [ -z "$docx_files" ]; then
+          # 1) Collect docx files from event commits[].added + commits[].modified (safe with spaces)
+          mapfile -t changed_files < <(jq -r '.commits[] | (.added + .modified)[]?' "$EVENT_PATH" 2>/dev/null || true)
+
+          docx_files=()
+          for f in "${changed_files[@]:-}"; do
+            # keep only .docx (case-insensitive)
+            case "${f,,}" in
+              *.docx) docx_files+=("$f") ;;
+            esac
+          done
+
+          # 2) Fallback: if none found from event JSON, use git diff (null-delimited) to safely capture paths with spaces
+          if [ ${#docx_files[@]} -eq 0 ]; then
             echo "No docx files found in event commits[]. Trying git diff between $BEFORE and $HEAD ..."
-            # Use git to list docx changed in the push
-            docx_files="$(git diff --name-only "$BEFORE" "$HEAD" -- '*.docx' || true)"
+            # git diff produces NUL-separated paths with -z
+            while IFS= read -r -d '' p; do
+              case "${p,,}" in
+                *.docx) docx_files+=("$p") ;;
+              esac
+            done < <(git diff --name-only -z "$BEFORE" "$HEAD" -- '*.docx' 2>/dev/null || printf '')
           fi
 
-          # If still empty, exit gracefully
-          if [ -z "$docx_files" ]; then
+          if [ ${#docx_files[@]} -eq 0 ]; then
             echo "No changed .docx files detected; nothing to do."
             exit 0
           fi
 
           echo "DOCX files to convert:"
-          printf '%s\n' $docx_files
+          for p in "${docx_files[@]}"; do printf ' - %s\n' "$p"; done
 
-          # For each changed .docx, convert in-place and place md + images beside the docx
           files_to_add=()
-          for file in $docx_files; do
-            # Skip if file not present in workspace (deleted)
+
+          # 3) Process each docx preserving spaces in filenames
+          for file in "${docx_files[@]}"; do
             if [ ! -f "$file" ]; then
               echo "File not found (skipping): $file"
               continue
@@ -70,74 +80,72 @@ jobs:
 
             echo "Processing: '$file' -> md: '$mdfile' images: '$images_target_dir'"
 
-            # Create a temporary dir for extraction and pandoc JSON
             TMPDIR="$(mktemp -d)"
-            trap 'rm -rf "$TMPDIR"' EXIT
+            # ensure TMPDIR is removed per-file
+            cleanup() {
+              rm -rf "$TMPDIR"
+            }
+            trap cleanup RETURN
 
-            # 1) Produce pandoc JSON and extract media into TMPDIR/extracted_media
+            # Produce pandoc JSON and extract media into TMPDIR/extracted_media
             echo "Running pandoc to JSON and extracting media..."
             pandoc "$file" -f docx -t json --extract-media="${TMPDIR}/extracted_media" -o "${TMPDIR}/doc.json"
 
-            # 2) Fix AST (script must be present in repo)
+            # Fix AST if script exists
             if [ -f "${GITHUB_WORKSPACE}/.github/scripts/fix_pandoc_ast.py" ]; then
               python3 "${GITHUB_WORKSPACE}/.github/scripts/fix_pandoc_ast.py" "${TMPDIR}/doc.json" "${TMPDIR}/doc.fixed.json"
             else
-              echo "Warning: AST fixer not found at .github/scripts/fix_pandoc_ast.py — skipping AST fix."
+              echo "Warning: AST fixer not found; using original json"
               cp "${TMPDIR}/doc.json" "${TMPDIR}/doc.fixed.json"
             fi
 
-            # 3) Convert fixed JSON back to Markdown while running pandoc from the doc's directory
-            #    so links inside the markdown will be relative to the md location (improves link correctness).
+            # Convert fixed JSON back to Markdown, create md next to the docx (so relative links work)
             mkdir -p "$dir"
             ( cd "$dir" && pandoc "${TMPDIR}/doc.fixed.json" -f json -t gfm -o "${mdfile}" )
 
-            # 4) Move extracted media into the required <name>/images directory
+            # Move extracted media into desired location <dir>/<filename>/images/
             mkdir -p "${images_target_dir}"
-            # pandoc extracts media files under extracted_media/media (common case), but sometimes files are directly in extracted_media
             if [ -d "${TMPDIR}/extracted_media/media" ]; then
-              echo "Moving extracted_media/media -> ${images_target_dir}"
+              # common pandoc layout
               mv "${TMPDIR}/extracted_media/media/"* "${images_target_dir}/" 2>/dev/null || true
             elif compgen -G "${TMPDIR}/extracted_media/*" >/dev/null 2>&1; then
-              echo "Moving extracted_media/* -> ${images_target_dir}"
               mv "${TMPDIR}/extracted_media/"* "${images_target_dir}/" 2>/dev/null || true
             else
               echo "No extracted media for $file"
             fi
 
-            # 5) Update links inside the generated md to point to the new images location.
-            #    We update by replacing each image filename occurrence with the relative path "<filename>/images/<basename>".
+            # Update image links inside md to point to "<filename>/images/<basename>"
             if [ -d "${images_target_dir}" ]; then
               for img in "${images_target_dir}"/*; do
                 [ -e "$img" ] || continue
                 base=$(basename "$img")
-                # Replace occurrences of the filename (just the basename) with the desired relative path in the markdown.
-                # We restrict replacement to likely image URL contexts to be safe.
-                perl -0777 -pe "s#(\\!\\[[^\\]]*\\]\\()([^\\)\\s\"']*${base})(\\))#\$1${filename}/images/${base}\$3#g" -i "${mdfile}" || true
-                # Replace HTML <img src="..."> and src='...' occurrences
-                perl -0777 -pe "s#(<img[^>]*src=\")[^\"]*${base}(\"[^>]*>)#\$1${filename}/images/${base}\$2#gi" -i "${mdfile}" || true
-                perl -0777 -pe "s#(<img[^>]*src=')[^']*${base}('[^>]*>)#\$1${filename}/images/${base}\$2#gi" -i "${mdfile}" || true
+                # Update markdown image syntax occurrences referencing just the basename
+                perl -0777 -pe "s#(\\!\\[[^\\]]*\\]\\()([^\\)\\s\"']*${base})(\\))#\$1${filename}/images/${base}\$3#g" -i "$mdfile" || true
+                # Update HTML img src double and single quotes
+                perl -0777 -pe "s#(<img[^>]*src=\")[^\"]*${base}(\"[^>]*>)#\$1${filename}/images/${base}\$2#gi" -i "$mdfile" || true
+                perl -0777 -pe "s#(<img[^>]*src=')[^']*${base}('[^>]*>)#\$1${filename}/images/${base}\$2#gi" -i "$mdfile" || true
               done
             fi
 
-            # 6) Run the md-level fixer to ensure images are on their own paragraphs and blockquote-safe.
+            # Run the md-level fixer to ensure images are on their own paragraphs and blockquote-safe
             if [ -f "${GITHUB_WORKSPACE}/.github/scripts/fix_md_images.py" ]; then
               python3 "${GITHUB_WORKSPACE}/.github/scripts/fix_md_images.py" "${mdfile}" --inplace || true
             else
-              echo "Warning: Markdown fixer not found at .github/scripts/fix_md_images.py — skipping md-level fix."
+              echo "Warning: Markdown fixer not found; skipping md-level fix."
             fi
 
-            # Add files to list to commit
-            files_to_add+=("${mdfile}")
+            # Add generated file paths to array for committing (quote paths)
+            files_to_add+=("$mdfile")
             if [ -d "${images_target_dir}" ]; then
               files_to_add+=("${images_target_dir}")
             fi
 
-            # Cleanup TMPDIR for this file (trap will remove any remaining)
-            rm -rf "${TMPDIR}"
-            trap - EXIT
+            # cleanup TMPDIR now (trap RETURN will also remove)
+            rm -rf "$TMPDIR"
+            trap - RETURN
           done
 
-          # 7) Commit only the generated md and image directories (if any)
+          # 4) Commit only the generated md and image directories
           if [ ${#files_to_add[@]} -eq 0 ]; then
             echo "No generated files to add/commit."
             exit 0
@@ -146,17 +154,16 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          # Add each generated file/dir explicitly
           for p in "${files_to_add[@]}"; do
-            echo "git add '$p'"
-            git add "$p" || true
+            echo "git add -- '$p'"
+            git add -- "$p" || true
           done
 
           git commit -m "Auto-convert changed DOCX -> Markdown (placed md next to docx; images in <name>/images)" || echo "No changes to commit"
-          # Push back to the same branch
           BRANCH="${GITHUB_REF#refs/heads/}"
           echo "Pushing to ${BRANCH}"
           git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}" "HEAD:${BRANCH}"
+
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
